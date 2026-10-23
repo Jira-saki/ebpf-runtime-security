@@ -1,0 +1,10 @@
+# eBPF compiled binaries
+*.o
+
+# Go build artifacts
+/drill/drill
+
+# OS / Editor temporary files
+*.swp
+*~
+.DS_Store
