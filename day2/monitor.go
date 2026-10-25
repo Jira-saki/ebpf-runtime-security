@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,6 +23,13 @@ type Event struct {
 	Comm     [16]byte
 	Filename [256]byte
 }
+type ConnectEvent struct {
+	Pid   uint32
+	Daddr uint32
+	Dport uint16
+	Pad   uint16
+	Comm  [16]byte
+}
 
 func main() {
 	// ปลดล็อกขีดจำกัดหน่วยความจำ memlock สำหรับ eBPF
@@ -35,6 +43,13 @@ func main() {
 		log.Fatalf("Loading BPF objects failed: %v", err)
 	}
 	defer objs.Close()
+
+	// แปะ Hook เข้ากับ Tracepoint sys_enter_connect
+	tpConnect, err := link.Tracepoint("syscalls", "sys_enter_connect", objs.TraceConnect, nil)
+	if err != nil {
+		log.Fatalf("Attaching sys_enter_connect failed: %v", err)
+	}
+	defer tpConnect.Close()
 
 	// แปะ Hook เข้ากับ Tracepoint sys_enter_openat
 	tp, err := link.Tracepoint("syscalls", "sys_enter_openat", objs.TraceOpenat, nil)
@@ -60,29 +75,30 @@ func main() {
 		<-stop
 		_ = rd.Close()
 	}()
-
-	var event Event
-	for {
+for {
 		record, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				fmt.Println("\n[*] Stopping eBPF monitor...")
+				log.Println("Received signal, exiting..")
 				return
+			}
+			log.Printf("reading from reader: %s", err)
+			continue
+		}
+
+		// 1. ถ้าขนาดตรงกับ ConnectEvent (28 bytes) ให้แสดง Connect
+		var connEvt ConnectEvent
+		if len(record.RawSample) == binary.Size(connEvt) {
+			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &connEvt); err == nil {
+				comm := strings.TrimRight(string(connEvt.Comm[:]), "\x00")
+				ip := net.IPv4(byte(connEvt.Daddr), byte(connEvt.Daddr>>8), byte(connEvt.Daddr>>16), byte(connEvt.Daddr>>24))
+
+				fmt.Printf("[CONNECT] PID: %-6d | Comm: %-12s -> %s:%d\n", connEvt.Pid, comm, ip, connEvt.Dport)
 			}
 			continue
 		}
 
-		// แปลง binary data กลับมาเป็นโครงสร้าง Struct
-		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			continue
-		}
-
-		comm := strings.TrimRight(string(event.Comm[:]), "\x00")
-		filename := strings.TrimRight(string(event.Filename[:]), "\x00")
-
-		// กรองเฉพาะพฤติกรรมที่แตะโฟลเดอร์ uploads หรือไฟล์ .php
-		if strings.Contains(filename, "uploads") || strings.HasSuffix(filename, ".php") {
-			fmt.Printf("\033[1;31m[!] [KERNEL TRACE] PID: %d (%s) opened file: %s\033[0m\n", event.Pid, comm, filename)
-		}
+		// 2. ถ้าขนาดตรงกับ Event ของ openat ให้ข้ามไปก่อน (หรือไม่ต้องแสดง)
+		// continue
 	}
 }
