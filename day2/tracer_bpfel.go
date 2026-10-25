@@ -16,8 +16,9 @@ import (
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	tracerMapEvents       = "events"
-	tracerProgTraceOpenat = "trace_openat"
+	tracerMapEvents        = "events"
+	tracerProgTraceConnect = "trace_connect"
+	tracerProgTraceOpenat  = "trace_openat"
 )
 
 // loadTracer returns the embedded CollectionSpec for tracer.
@@ -62,7 +63,8 @@ type tracerSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type tracerProgramSpecs struct {
-	TraceOpenat *ebpf.ProgramSpec `ebpf:"trace_openat"`
+	TraceConnect *ebpf.ProgramSpec `ebpf:"trace_connect"`
+	TraceOpenat  *ebpf.ProgramSpec `ebpf:"trace_openat"`
 }
 
 // tracerMapSpecs contains maps before they are loaded into the kernel.
@@ -117,11 +119,13 @@ type tracerVariables struct {
 //
 // It can be passed to loadTracerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type tracerPrograms struct {
-	TraceOpenat *ebpf.Program `ebpf:"trace_openat"`
+	TraceConnect *ebpf.Program `ebpf:"trace_connect"`
+	TraceOpenat  *ebpf.Program `ebpf:"trace_openat"`
 }
 
 func (p *tracerPrograms) Close() error {
 	return _TracerClose(
+		p.TraceConnect,
 		p.TraceOpenat,
 	)
 }
