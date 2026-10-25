@@ -1,32 +1,35 @@
 # eBPF Runtime Security Detection Drill
 
-A low-overhead, kernel-level runtime security probe built with **C (eBPF)** and **Go (`cilium/ebpf`)**. It traces the `openat` and `execve` system calls in real time to surface two classic post-exploitation behaviors: **web shell file drops** and **suspicious process execution** (reverse shell spawning / RCE).
+A low-overhead, kernel-level runtime security lab built with **C (eBPF)** and **Go (`cilium/ebpf`)**. Across its phases it traces `openat`, `execve`, and `connect` system calls to surface file drops, suspicious command execution, and outbound network connections.
 
 > [!WARNING]
-> This is a **lab / training project**. The target server in `drill/main.go` is intentionally vulnerable (unauthenticated file upload). Run it only in an isolated environment and never expose port `8080` publicly.
+> This is a **lab / training project**. The target server in `day2/main.go` is intentionally vulnerable (unauthenticated file upload). Run it only in an isolated environment and never expose port `8080` publicly.
 
 ---
 
 ## Architecture Overview
 
-Probes in the kernel emit an event for every `openat` / `execve` call. The Go consumer reads events from a ring buffer and applies the detection filters in userspace.
+The phases attach eBPF probes to syscall tracepoints. Phase 3 reads IPv4 destination details from `connect` calls and reports them from the Go userspace consumer through a shared ring buffer.
 
 ```text
-[ Attacker / Web Shell ]
+[ Process / Web Shell ]
            │
-           │  (System Calls: openat / execve)
+           │  (System Calls: openat / execve / connect)
            ▼
 ┌────────────────────────────────────────────────────────┐
 │                   Linux Kernel Space                   │
 │                                                        │
-│   SEC("tracepoint/syscalls/sys_enter_openat")          │
+│   Phase 1: sys_enter_openat                            │
 │   └── Captures PID, comm, and filename                 │
 │                                                        │
-│   SEC("tracepoint/syscalls/sys_enter_execve")          │
+│   Phase 2: sys_enter_execve                            │
 │   └── Captures PID, comm, and executed path            │
 │                                                        │
+│   Phase 3: sys_enter_connect                           │
+│   └── Captures PID, comm, and IPv4 destination + port  │
+│                                                        │
 │   ┌────────────────────────────────────────────────┐   │
-│   │           BPF_MAP_TYPE_RINGBUF (Events)        │   │
+│   │           BPF_MAP_TYPE_RINGBUF (Events)         │   │
 │   └───────────────────────┬────────────────────────┘   │
 └───────────────────────────┼────────────────────────────┘
                             │ (Shared ring buffer)
@@ -34,10 +37,9 @@ Probes in the kernel emit an event for every `openat` / `execve` call. The Go co
 │                           ▼                            │
 │                   Go Userspace Consumer                │
 │                                                        │
-│   • Ring buffer event polling                          │
-│   • Null-byte trimming of comm / filename              │
-│   • Detection filters (uploads, .php, sh, bash, ...)   │
-│   • Color-coded alerts to console                      │
+│   • Ring buffer event polling and decoding             │
+│   • Phase 1/2: file-drop and command detection         │
+│   • Phase 3: print IPv4 connection destination         │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -45,13 +47,13 @@ Probes in the kernel emit an event for every `openat` / `execve` call. The Go co
 
 ## Key Features
 
-- **Direct Kernel Tracing**: Hooks the `sys_enter_openat` and `sys_enter_execve` tracepoints without modifying any application code.
+- **Direct Kernel Tracing**: Phases 1-3 hook `sys_enter_openat`, `sys_enter_execve`, and `sys_enter_connect` without modifying application code.
 - **Ring Buffer Transport**: Uses `BPF_MAP_TYPE_RINGBUF` (16 MiB) for efficient, ordered event delivery from kernel to userspace.
-- **Userspace Detection Rules**: Filters are plain Go code in `monitor.go`, so they are easy to read and change without recompiling the BPF program.
-- **Alert Output**: File drops are printed in red and command executions in yellow.
+- **Userspace Processing**: Go decodes events from the ring buffer; Phase 3 prints outbound IPv4 destination addresses and ports.
+- **Detection Output**: Phase 1/2 report file drops and command executions; Phase 3 reports connection attempts.
 
 > [!NOTE]
-> The probes read syscall arguments at fixed offsets (`ctx + 24` for `openat`, `ctx + 16` for `execve`), which match x86_64 on Linux 6.8 (Ubuntu 24.04). Other kernels or architectures may need different offsets.
+> The probes read syscall arguments using tracepoint layouts and offsets that are architecture/kernel dependent. The `connect` probe currently supports IPv4 (`AF_INET`) only. Other kernels or architectures may need adjustments.
 
 ---
 
@@ -59,19 +61,28 @@ Probes in the kernel emit an event for every `openat` / `execve` call. The Go co
 
 ```text
 .
-├── .gitignore
+├── go.mod                 # Root namespace/chroot exercise
+├── go.sum
+├── main.go                # Minimal container-like namespace runner
 ├── README.md
-└── drill/
+├── myrootfs/              # Minimal Alpine root filesystem for the runner
+├── day1/
+│   ├── go.mod
+│   ├── main.go            # Intentionally vulnerable HTTP upload server
+│   ├── monitor.go         # openat/execve monitor and detection rules
+│   ├── tracer.bpf.c
+│   ├── tracer_bpfeb.go    # Generated Go bindings (big-endian)
+│   └── tracer_bpfel.go    # Generated Go bindings (little-endian)
+└── day2/
     ├── go.mod
-    ├── go.sum
-    ├── main.go            # Intentionally vulnerable HTTP upload server (target)
-    ├── monitor.go         # Userspace eBPF loader and event processor
-    ├── tracer.bpf.c       # Kernel-space eBPF C program (openat + execve probes)
+    ├── main.go            # Intentionally vulnerable HTTP upload server
+    ├── monitor.go         # openat/connect tracepoint consumer
+    ├── tracer.bpf.c       # openat + connect probes
     ├── tracer_bpfeb.go    # Generated Go bindings (big-endian)
     └── tracer_bpfel.go    # Generated Go bindings (little-endian)
 ```
 
-Compiled `*.o` files are generated by `bpf2go` and ignored by git. The repository also contains earlier iterations (`day2/` and the root-level `main.go`) that are not covered here.
+Compiled `*.o` files are generated by `bpf2go` and ignored by git. Phases 1-2 are in `day1/`; Phase 3 is in `day2/`.
 
 ---
 
@@ -90,14 +101,14 @@ sudo apt update && sudo apt install -y clang llvm libbpf-dev linux-headers-$(una
 
 ## Getting Started
 
-All commands run from the `drill/` directory.
+The commands below run from `day2/` and exercise Phase 3.
 
 ### 1. Compile the eBPF Programs
 
 Compile the C probes into BPF bytecode and generate the Go bindings with `bpf2go`:
 
 ```bash
-cd drill
+cd day2
 go run github.com/cilium/ebpf/cmd/bpf2go -go-package main tracer tracer.bpf.c
 ```
 
@@ -116,19 +127,15 @@ Both `main.go` and `monitor.go` define `main()`, so run them by file name rather
 
 ```bash
 sudo go run monitor.go tracer_bpfel.go
-# [*] eBPF Monitor ACTIVE: Watching both [openat] and [execve]...
 ```
 
 Press `Ctrl+C` to detach the probes and exit.
 
-### 4. Trigger Detections (Terminal 3)
+### 4. Trigger Network Egress (Terminal 3)
 
 ```bash
-# Scenario A: drop a fake web shell via the upload endpoint
-curl -X POST --data '<?php system($_GET["c"]); ?>' http://localhost:8080/upload
-
-# Scenario B: spawn a shell and run a recon command
-sh -c whoami
+# Initiate an outbound IPv4 connection; the monitor prints its destination and port
+curl -I https://example.com
 ```
 
 ---
@@ -156,26 +163,37 @@ Reported when the executed path contains `whoami`, `sh`, or `bash`:
 > [!NOTE]
 > Matching uses simple substring checks, so it is intentionally broad. For example, `sh` also matches `/usr/bin/ssh`. Tighten the rules in `monitor.go` for anything beyond a drill.
 
+### Scenario C: Outbound Network Connection (`connect`)
+
+Reported when a process attempts an IPv4 connection. Phase 3 currently logs the destination and port without filtering:
+
+```text
+[CONNECT] PID: 1842   | Comm: curl         -> 93.184.216.34:443
+```
+
+The remote address depends on DNS and can differ between runs.
+
 ---
 
 ## Security Context & CKS Mapping
 
 This project demonstrates, at a small scale, the foundation used by cloud-native runtime security engines such as Falco and Cilium Tetragon. The right-hand column shows *approximate* Falco-style equivalents:
 
-| Stage | Mechanism | Approximate Falco Rule Condition |
-| :--- | :--- | :--- |
-| **File Dropped** | `tracepoint/syscalls/sys_enter_openat` | `evt.type = openat and fd.directory = /tmp/uploads` |
-| **Shell Spawned** | `tracepoint/syscalls/sys_enter_execve` | `evt.type = execve and proc.name in (sh, bash)` |
-| **Reconnaissance** | `tracepoint/syscalls/sys_enter_execve` | `evt.type = execve and proc.name = whoami` |
+| Stage | Mechanism | CKS concept | Approximate Falco Rule Condition |
+| :--- | :--- | :--- | :--- |
+| **File Dropped** | `tracepoint/syscalls/sys_enter_openat` | Runtime threat detection | `evt.type = openat and fd.directory = /tmp/uploads` |
+| **Shell Spawned** | `tracepoint/syscalls/sys_enter_execve` | Runtime threat detection | `evt.type = execve and proc.name in (sh, bash)` |
+| **Reconnaissance** | `tracepoint/syscalls/sys_enter_execve` | Runtime threat detection | `evt.type = execve and proc.name = whoami` |
+| **Network Egress** | `tracepoint/syscalls/sys_enter_connect` | NetworkPolicies restrict pod egress; this probe detects connection attempts but does not enforce policy | `evt.type = connect and fd.typechar = 4` |
 
 ---
 
 ## Limitations
 
-- Every `openat` / `execve` call is sent to userspace; filtering is not done in the kernel, which adds overhead on busy hosts.
-- Only the syscall entry is traced; the result of the call (success or failure) is not recorded.
+- Syscall entry is traced, so the result of the call (success or failure) is not recorded; connect events indicate attempts, not established connections.
+- Phase 3 currently captures IPv4 (`AF_INET`) destinations only; IPv6 is not handled.
 - Filenames are read as passed by the process (relative paths are not resolved).
-- Hardcoded argument offsets are not portable across kernels (see the note above). Using BTF / CO-RE would remove this limitation.
+- Tracepoint argument layouts and offsets are not portable across all kernels/architectures. Using BTF / CO-RE would reduce this limitation.
 
 ---
 
@@ -183,7 +201,7 @@ This project demonstrates, at a small scale, the foundation used by cloud-native
 
 - [x] Phase 1: File drop tracing via `sys_enter_openat`
 - [x] Phase 2: Command & shell spawn tracing via `sys_enter_execve`
-- [ ] Phase 3: Outbound network connection tracing via `sys_enter_connect`
+- [x] Phase 3: Outbound network connection tracing via `sys_enter_connect`
 - [ ] Phase 4: Automated mitigation (e.g. process termination via `SIGKILL`)
 - [ ] Phase 5: Inline execution prevention using eBPF LSM hooks (`bpf_lsm`)
 - [ ] Phase 6: Move filtering into the kernel and adopt BTF / CO-RE for portability
